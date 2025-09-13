@@ -14,6 +14,18 @@ import plotly.express as px
 
 app = FastAPI(title="shakuntala")
 
+@app.on_event("startup")
+def load_models():
+    """Load all machine learning models once at startup."""
+    print("Loading models...")
+    MODELS["embedding"] = SentenceTransformer("all-MiniLM-L6-v2")
+    MODELS["qa"] = pipeline("text2text-generation", model="google/flan-t5-small")
+    print("Models loaded successfully.")
+
+RAW_DF = None
+vector_index = None
+documents = None
+
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
@@ -57,21 +69,25 @@ def read_pdf(content: bytes) -> pd.DataFrame:
 def detect_anomalies(df: pd.DataFrame):
     col = None
     for c in df.columns:
-        if str(c).lower in ["amount", "money", "value", "transaction", "amt"]:
+        if str(c).lower() in ["amount", "money", "value", "transaction", "amt"]:
             col = c
             break
-        
-        
+
     if col is None:
-        df["anomaly_flag"]=0
-        return df,pd.DataFrame()
+        df["anomaly_flag"] = 0
+        return df, pd.DataFrame()
 
     df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=[col])
+
+    # Isolation Forest
     model = IsolationForest(contamination=0.1, random_state=42)
     df["anomaly_score"] = model.fit_predict(df[[col]])
-    df["anomaly_flag"] = df["anomaly_flag"].apply(lambda x: 1 if x == -1 else 0)
+
+    df["anomaly_flag"] = df["anomaly_score"].apply(lambda x: 1 if x == -1 else 0)
+
     anomalies = df[df["anomaly_flag"] == 1]
+
     return df, anomalies
 
 def df_to_chunks(df: pd.DataFrame) -> List[str]:
@@ -131,7 +147,6 @@ async def analyze_file(file: UploadFile = File(...)):
     global RAW_DF
     contents = await file.read()
 
-    # Detect file type
     if file.filename.endswith((".xlsx", ".xls")):
         df = read_excel(contents)
     elif file.filename.endswith(".pdf"):
@@ -141,7 +156,6 @@ async def analyze_file(file: UploadFile = File(...)):
 
     df, anomalies = detect_anomalies(df)
 
-    # store globally for visualisation
     RAW_DF = df.copy()
 
     anomalies_json = anomalies.to_dict(orient="records")
@@ -157,47 +171,59 @@ async def analyze_file(file: UploadFile = File(...)):
 @app.post("/upload/")
 async def upload_and_index(file: UploadFile = File(...)):
     global RAW_DF, vector_index, documents
-    
+
     contents = await file.read()
-    
+
     # Parse Excel/PDF into DataFrame
-    if file.filename.endswith(".xlsx") or file.filename.endswith(".xls"):
+    if file.filename.endswith((".xlsx", ".xls")):
         df = pd.read_excel(io.BytesIO(contents))
     elif file.filename.endswith(".pdf"):
-        df = read_pdf(contents)
+        df = read_pdf(contents)  # <-- your pdf reader function
     else:
         return {"error": "Unsupported file type"}
-    
+
     RAW_DF = df.copy()
-    
+
     # Build text chunks for RAG
     chunks = df.astype(str).agg(" | ".join, axis=1).tolist()
     documents = chunks
-    
-    #vector_index, _ = build_faiss_index(chunks)
-    build_faiss_index(chunks)
-    
+
+    # Build FAISS index
+    build_faiss_index(chunks)   # this function updates global FAISS_INDEX, DOCS
+
     return {
         "status": "file indexed",
+        "filename": file.filename,
+        "rows": len(df),
         "total_chunks": len(chunks)
     }
-
-
+    
 class ChatRequest(BaseModel):
     query: str
+
 
 @app.post("/chat/")
 async def chat(req: ChatRequest):
     results = search_index(req.query, top_k=3)
     context = "\n".join([r["text"] for r in results])
 
-    qa = pipeline("text-generation", model="distilgpt2")
-    prompt = f"Context:\n{context}\n\nQuestion: {req.query}\nAnswer:"
+    qa_pipeline = pipeline(
+        "text2text-generation", 
+        model="google/flan-t5-small" 
+    )
 
-    raw_output = qa(prompt, max_new_tokens=100, do_sample=True)[0]["generated_text"]
+    prompt = f"""
+    Context: {context}
 
-    # keep only the part after "Answer:"
-    answer = raw_output.split("Answer:")[-1].strip()
+    Question: {req.query}
+
+    Answer the question based on the context provided.
+    """
+
+    output = qa_pipeline(prompt, max_length=100)
+    
+    answer = output[0]['generated_text']
+
 
     return {"answer": answer, "sources": results}
 
@@ -206,10 +232,8 @@ async def visualize():
     global RAW_DF
     if RAW_DF is None or RAW_DF.empty:
         raise HTTPException(status_code=400, detail="No file uploaded yet. Please upload first.")
-
     df = RAW_DF.copy().reset_index(drop=True)
 
-    # detect numeric column (amount, value, etc.)
     col = None
     for c in df.columns:
         if str(c).lower() in ["amount", "money", "value", "transaction", "amt"]:
@@ -217,26 +241,18 @@ async def visualize():
             break
     if col is None:
         raise HTTPException(status_code=400, detail="No numeric transaction column found.")
-
-    # ensure numeric conversion
     df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=[col])
     if df.empty:
         raise HTTPException(status_code=400, detail="No valid numeric values in column.")
-
-    # x-axis
     if "date" in df.columns:
         x_axis = "date"
     elif "time" in df.columns:
         x_axis = "time"
     else:
-        x_axis = df.index  
-
+        x_axis = df.index
     hover_cols = [c for c in df.columns if c not in ["anomaly_flag", "anomaly_score"]]
-
     fig = px.line(df, x=x_axis, y=col, title="Money Flow Over Time", hover_data=hover_cols)
-
-    # highlight anomalies if present
     if "anomaly_flag" in df.columns:
         anomalies = df[df["anomaly_flag"] == 1]
         fig.add_scatter(
@@ -245,18 +261,13 @@ async def visualize():
             mode="markers",
             marker=dict(color="red", size=10, symbol="x"),
             name="Anomalies",
-            hovertext=[
-                "<br>".join([f"{c}: {row[c]}" for c in hover_cols])
-                for _, row in anomalies.iterrows()
-            ],
-            hoverinfo="text"
+            hovertext=["<br>".join([f"{c}: {row[c]}" for c in hover_cols]) for _, row in anomalies.iterrows()],
+            hoverinfo="text",
         )
-
     fig.update_layout(
         xaxis_title="Date" if isinstance(x_axis, str) else "Transaction Index",
         yaxis_title=col.capitalize(),
-        template="plotly_white"
+        template="plotly_white",
     )
-
     html = fig.to_html(full_html=True)
     return HTMLResponse(content=html)
