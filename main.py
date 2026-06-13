@@ -35,7 +35,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows your friends' servers to query your API from anywhere
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
